@@ -1,0 +1,175 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 12 12:06:38 2024
+
+@author: hnf514
+"""
+
+"""
+
+import os
+import requests
+import pandas as pd
+import time
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+from requests.adapters import HTTPAdapter
+from requests.exceptions import ChunkedEncodingError, RequestException
+from urllib3.util.retry import Retry
+from sklearn.preprocessing import MinMaxScaler
+
+# Retry Strategy for API Requests
+retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+session = requests.Session()
+session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
+
+# RL Hyperparameters
+STATE_SIZE = 3  # [Traffic Load, Power Consumption, UE Throughput]
+ACTION_SIZE = 5  # Corresponds to 5 mask values
+GAMMA = 0.9
+LEARNING_RATE = 0.001
+EPSILON = 1.0
+EPSILON_MIN = 0.1
+EPSILON_DECAY = 0.995
+MEMORY_SIZE = 2000
+BATCH_SIZE = 32
+
+# API Endpoints
+URL_CELL_REPORTS = "http://144.32.33.150/sba/influx/query?q=SELECT%20*%20FROM%20CellReports%20GROUP%20BY%20%22Viavi.Cell.Name%22%20ORDER%20BY%20time%20DESC%20LIMIT%201"
+URL_UE_REPORTS = "http://144.32.33.150/sba/influx/query?q=SELECT%20*%20FROM%20UEReports%20WHERE%20%22report%22%3D'serving'%20OR%20%22report%22%3D'neighbour'%20Group%20By%20%22Viavi.UE.Name%22%20ORDER%20BY%20time%20DESC%20LIMIT%2010"
+
+# Mask Values for mMIMO Order Adjustment
+MASK_VALUES = [
+    "1111111111111111111111111111111111111111111111111111111111111111",  # Full Power
+    "1111111100000000000000000000000000000000000000000000000000000000",  # Reduced Power
+    "1111111111111111000000000000000000000000000000000000000000000000",  # Mid Power
+    "1111111111111111111111111111111100000000000000000000000000000000",  # Lower Power
+    "1111111111111111111111111111111111111111111111111111111111111111",  # Reset to Full Power
+]
+
+# Cell Configuration Mapping
+elements = {
+    "s0_cellcu": {"ManagedElement": "1193046", "GnbDuFunction": "1", "NrCellDu": "1", "NESPolicy": "1"},
+    "s1_cellcu": {"ManagedElement": "1193046", "GnbDuFunction": "2", "NrCellDu": "2", "NESPolicy": "1"},
+    "s2_cellcu": {"ManagedElement": "1193046", "GnbDuFunction": "3", "NrCellDu": "3", "NESPolicy": "1"},
+}
+
+# RL Neural Network
+class DQN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(state_size, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, action_size)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+# RL Agent
+class RLAgent:
+    def __init__(self):
+        self.model = DQN(STATE_SIZE, ACTION_SIZE)
+        self.target_model = DQN(STATE_SIZE, ACTION_SIZE)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
+        self.loss_fn = nn.MSELoss()
+        self.memory = deque(maxlen=MEMORY_SIZE)
+        self.epsilon = EPSILON
+
+    def store_experience(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return np.random.choice(ACTION_SIZE)  # Explore
+        state_tensor = torch.tensor(state, dtype=torch.float32)
+        q_values = self.model(state_tensor)
+        return torch.argmax(q_values).item()  # Exploit
+
+    def train(self):
+        if len(self.memory) < BATCH_SIZE:
+            return
+        minibatch = random.sample(self.memory, BATCH_SIZE)
+        for state, action, reward, next_state, done in minibatch:
+            state_tensor = torch.tensor(state, dtype=torch.float32)
+            next_state_tensor = torch.tensor(next_state, dtype=torch.float32)
+            target = reward
+            if not done:
+                target += GAMMA * torch.max(self.target_model(next_state_tensor)).item()
+            target_f = self.model(state_tensor).clone()
+            target_f[action] = target
+            self.optimizer.zero_grad()
+            loss = self.loss_fn(self.model(state_tensor), target_f)
+            loss.backward()
+            self.optimizer.step()
+        if self.epsilon > EPSILON_MIN:
+            self.epsilon *= EPSILON_DECAY
+
+# Initialize RL Agent
+agent = RLAgent()
+scaler = MinMaxScaler()
+
+# Function to fetch KPI data
+def fetch_kpi_data():
+    try:
+        df_cell = pd.DataFrame(session.get(URL_CELL_REPORTS).json()["results"][0]["series"][0]["values"])
+        df_ue = pd.DataFrame(session.get(URL_UE_REPORTS).json()["results"][0]["series"][0]["values"])
+        return df_cell, df_ue
+    except Exception as e:
+        print(f"Error fetching KPI data: {e}")
+        return None, None
+
+# Function to send mMIMO reconfiguration
+def reconfigure_mMIMO(mask_value, element_name):
+    action_pow = {
+        "attributes": {
+            "policyType": "TRX_CONTROL",
+            "antennaMask": mask_value
+        }
+    }
+    txt_param = ",".join([f"{k}={v}" for k, v in elements[element_name].items()])
+    put_url = f"http://144.32.33.150/O1/CM/{txt_param}"
+
+    try:
+        put_response = session.put(put_url, json=action_pow, timeout=10)
+        if put_response.status_code == 200:
+            print(f"mMIMO reconfigured successfully for {element_name}: {mask_value}")
+        else:
+            print(f"Reconfiguration failed, response code = {put_response.status_code}")
+    except Exception as e:
+        print(f"Error in reconfiguring mMIMO: {e}")
+
+# RL Training Loop
+for episode in range(10):
+    print(f"\nEpisode {episode+1}/10 - Training RL Agent for mMIMO Optimization")
+
+    df_cell, df_ue = fetch_kpi_data()
+    if df_cell is None or df_ue is None:
+        continue  # Skip this episode if data isn't available
+
+    # Process KPIs
+    traffic_load = df_cell.iloc[:, 2].mean()
+    power_consumption = df_cell.iloc[:, 3].sum()
+    avg_ue_throughput = df_ue.iloc[:, 5].mean()
+
+    # Normalize KPIs
+    state = np.array([traffic_load, power_consumption, avg_ue_throughput]).reshape(1, -1)
+    state = scaler.fit_transform(state)[0]
+
+    # RL Decision - Select Mask
+    action = agent.act(state)
+    mask_value = MASK_VALUES[action]
+
+    # Apply RL-based mMIMO reconfiguration to all cells
+    for element in elements.keys():
+        reconfigure_mMIMO(mask_value, element)
+
+    # Train RL Agent
+    agent.train()
+
+print("\nTraining Completed - RL-based mMIMO Optimization Ready!")
